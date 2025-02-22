@@ -2,6 +2,8 @@
 
 LWM is a minimalistic window manager for the X Window System built with XCB, designed for simplicity and efficiency. It provides basic window management features like moving, resizing, maximizing, and closing windows, alongside additional controls for transparency and window ordering.
 
+![Image](https://github.com/user-attachments/assets/7f54e7ca-0525-4c04-b310-0557bdb39625)
+
 ### Features
 Key Bindings:
  *  - Alt+Mouse Left/Right for window move/resize (with edge snapping).
