@@ -8,7 +8,7 @@
  *  - Alt+Q shows an exit confirmation dialog.
  *  - Alt+R shows a "Runner" prompt (with a larger font).
  *  - Alt+Tab cycles through windows.
- *  - Alt+I shows a help dialog with key bindings.
+ *  - Alt+I shows a help popup window with an Exit button.
  *  - Alt+M minimizes a window.
  *  - Alt+N restores all minimized windows.
  *  - Focus follows mouse.
@@ -63,6 +63,16 @@
 static constexpr uint16_t RUNNER_WIDTH  = 300;
 static constexpr uint16_t RUNNER_HEIGHT = 50;
 
+// Help window dimensions
+static constexpr uint16_t HELP_WIDTH  = 400;
+static constexpr uint16_t HELP_HEIGHT = 240;
+
+// Exit button dimensions (inside help window)
+static constexpr int EXIT_BTN_X = 350;
+static constexpr int EXIT_BTN_Y = 10;
+static constexpr int EXIT_BTN_W = 40;
+static constexpr int EXIT_BTN_H = 20;
+
 // Snapping threshold (in pixels)
 static constexpr int SNAP_THRESHOLD = 10;
 
@@ -84,7 +94,9 @@ using UniqueXCBReply = std::unique_ptr<T, XCBReplyDeleter<T>>;
  ******************************************************************************/
 class Logger {
 public:
-    Logger(const std::string &logFilePath) : m_logFilePath(logFilePath), m_active(true) {
+    explicit Logger(const std::string &logFilePath)
+        : m_logFilePath(logFilePath), m_active(true)
+    {
         m_loggerThread = std::thread(&Logger::logWorker, this);
     }
 
@@ -100,7 +112,7 @@ public:
 
     void log(const std::string &msg) {
 #ifndef DEBUG_LOGS
-        (void)msg; // Mark msg as unused when debug logs are disabled.
+        (void)msg; // Do nothing when debug logs are disabled.
 #else
         std::lock_guard<std::mutex> lock(m_mutex);
         m_queue.push(msg);
@@ -134,11 +146,28 @@ private:
 };
 
 /*******************************************************************************
+ * Helper: Fill a window or rectangle area with a solid color.
+ *
+ * This function reduces code duplication when drawing the background.
+ ******************************************************************************/
+static void fillRect(xcb_connection_t* conn, xcb_window_t win, int x, int y,
+                     int width, int height, uint32_t color) {
+    xcb_gcontext_t gc = xcb_generate_id(conn);
+    uint32_t mask = XCB_GC_FOREGROUND | XCB_GC_BACKGROUND;
+    uint32_t vals[2] = { color, color };
+    xcb_create_gc(conn, gc, win, mask, vals);
+    xcb_rectangle_t rect = { static_cast<int16_t>(x), static_cast<int16_t>(y),
+                             static_cast<uint16_t>(width), static_cast<uint16_t>(height) };
+    xcb_poly_fill_rectangle(conn, win, gc, 1, &rect);
+    xcb_free_gc(conn, gc);
+}
+
+/*******************************************************************************
  * WindowManager (WM) class
  ******************************************************************************/
 class WM {
 public:
-    WM(Logger &logger) : m_logger(logger) {}
+    explicit WM(Logger &logger) : m_logger(logger) {}
     ~WM() = default;
 
     bool initialize();
@@ -180,7 +209,7 @@ private:
     // Fullscreen toggle
     void toggleFullscreen(xcb_window_t w);
 
-    // Runner, Exit, and Help dialogs
+    // Runner, Exit, and Help dialogs / popups
     void createPopUpWindow(const char* title,
                            xcb_window_t &winVar,
                            uint16_t width, uint16_t height,
@@ -197,9 +226,9 @@ private:
     void handleRunnerInput(xcb_keysym_t ks);
     void executeCommand(const std::string &cmd);
 
-    // Help dialog functions
-    void createHelpDialog();
-    void destroyHelpDialog();
+    // Help popup functions (non‑modal now)
+    void createHelpPopup();
+    void destroyHelpPopup();
 
     // Move/Resize structures
     struct MoveStart {
@@ -240,7 +269,7 @@ private:
     bool         m_isExitConfirmationActive = false;
     xcb_window_t m_exitConfirmationWindow   = XCB_NONE;
 
-    // Help dialog state
+    // Help popup state (non-modal)
     bool         m_isHelpActive = false;
     xcb_window_t m_helpWindow   = XCB_NONE;
 
@@ -281,8 +310,7 @@ std::optional<xcb_screen_t*> WM::setupScreen(int scrNum) {
     while (scrNum-- > 0) {
         xcb_screen_next(&it);
     }
-    if(it.data) return it.data;
-    return std::nullopt;
+    return it.data ? std::optional<xcb_screen_t*>{it.data} : std::nullopt;
 }
 
 bool WM::initialize()
@@ -328,7 +356,7 @@ bool WM::initialize()
 bool WM::setupEWMH()
 {
     std::memset(&m_ewmh, 0, sizeof(m_ewmh));
-    xcb_intern_atom_cookie_t *cookies = xcb_ewmh_init_atoms(m_conn, &m_ewmh);
+    auto *cookies = xcb_ewmh_init_atoms(m_conn, &m_ewmh);
     if (!xcb_ewmh_init_atoms_replies(&m_ewmh, cookies, nullptr)) {
         return false;
     }
@@ -340,8 +368,7 @@ void WM::setupAtoms()
     auto get_atom = [this](const char* name) -> xcb_atom_t {
         xcb_intern_atom_cookie_t c = xcb_intern_atom(m_conn, 0, std::strlen(name), name);
         UniqueXCBReply<xcb_intern_atom_reply_t> r(xcb_intern_atom_reply(m_conn, c, nullptr));
-        if (!r) return XCB_NONE;
-        return r->atom;
+        return r ? r->atom : XCB_NONE;
     };
 
     WM_PROTOCOLS             = get_atom("WM_PROTOCOLS");
@@ -401,11 +428,9 @@ void WM::selectInputOnRoot()
 void WM::grabKeysAndButtons()
 {
     const uint16_t MOD_MASK = XCB_MOD_MASK_1; // "Alt"
-
     xcb_keysym_t keysToGrab[] = {
         XK_f, XK_e, XK_q, XK_r, XK_Tab, XK_i, XK_m, XK_n
     };
-
     const uint16_t modifiers[] = {
         MOD_MASK,
         static_cast<uint16_t>(MOD_MASK | XCB_MOD_MASK_LOCK),
@@ -418,24 +443,19 @@ void WM::grabKeysAndButtons()
             xcb_keycode_t *kc = xcb_key_symbols_get_keycode(m_keysyms, ks);
             if (!kc) continue;
             for (int i = 0; kc[i] != XCB_NO_SYMBOL; i++) {
-                xcb_grab_key(m_conn, 1, m_screen->root,
-                             mod, kc[i],
+                xcb_grab_key(m_conn, 1, m_screen->root, mod, kc[i],
                              XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC);
             }
             free(kc);
         }
-        // Grab buttons for move/resize.
         xcb_grab_button(m_conn, 1, m_screen->root,
             XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION,
             XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC,
-            XCB_NONE, XCB_NONE,
-            1, mod);
-
+            XCB_NONE, XCB_NONE, 1, mod);
         xcb_grab_button(m_conn, 1, m_screen->root,
             XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION,
             XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC,
-            XCB_NONE, XCB_NONE,
-            3, mod);
+            XCB_NONE, XCB_NONE, 3, mod);
     }
     xcb_flush(m_conn);
 }
@@ -443,22 +463,18 @@ void WM::grabKeysAndButtons()
 void WM::setupSupportingWMCheck()
 {
     xcb_window_t wmCheckWin = xcb_generate_id(m_conn);
-
     xcb_create_window(m_conn, m_screen->root_depth, wmCheckWin, m_screen->root,
                       -100, -100, 1, 1, 0,
                       XCB_WINDOW_CLASS_INPUT_OUTPUT,
                       m_screen->root_visual, 0, nullptr);
-
     xcb_change_property(m_conn, XCB_PROP_MODE_REPLACE, wmCheckWin,
                         _NET_SUPPORTING_WM_CHECK, XCB_ATOM_WINDOW, 32, 1, &wmCheckWin);
     xcb_change_property(m_conn, XCB_PROP_MODE_REPLACE, m_screen->root,
                         _NET_SUPPORTING_WM_CHECK, XCB_ATOM_WINDOW, 32, 1, &wmCheckWin);
-
     const char* wmName = "EnhancedMinimalWM";
     xcb_change_property(m_conn, XCB_PROP_MODE_REPLACE, wmCheckWin,
                         m_ewmh._NET_WM_NAME, XCB_ATOM_STRING, 8,
                         std::strlen(wmName), wmName);
-
     xcb_map_window(m_conn, wmCheckWin);
     xcb_flush(m_conn);
 }
@@ -470,7 +486,6 @@ void WM::runEventLoop()
         xcb_generic_event_t *ev = xcb_wait_for_event(m_conn);
         if (!ev) break; // error or connection closed
         uint8_t rt = ev->response_type & ~0x80;
-
         switch (rt) {
             case XCB_KEY_PRESS:
                 handleKeyPress(reinterpret_cast<xcb_key_press_event_t*>(ev));
@@ -508,7 +523,11 @@ void WM::runEventLoop()
                 break;
 #endif
             default:
+#ifndef DEBUG_LOGS
+                (void)rt;
+#else
                 m_logger.log("Unhandled event type: " + std::to_string(rt));
+#endif
                 break;
         }
         free(ev);
@@ -521,12 +540,10 @@ void WM::cleanup()
         xcb_destroy_window(m_conn, w);
     }
     xcb_flush(m_conn);
-
     if (m_cursor != XCB_CURSOR_NONE) {
         xcb_free_cursor(m_conn, m_cursor);
     }
     xcb_ewmh_connection_wipe(&m_ewmh);
-
     if (m_keysyms) {
         xcb_key_symbols_free(m_keysyms);
         m_keysyms = nullptr;
@@ -539,7 +556,7 @@ void WM::cleanup()
 
 void WM::focusWindow(xcb_window_t w)
 {
-    if (!w || w == XCB_NONE) return;
+    if (w == XCB_NONE) return;
     uint32_t vals[] = { XCB_STACK_MODE_ABOVE };
     xcb_configure_window(m_conn, w, XCB_CONFIG_WINDOW_STACK_MODE, vals);
     xcb_map_window(m_conn, w);
@@ -554,8 +571,7 @@ void WM::focusNextWindow()
     for (size_t i = 0; i < sz; i++) {
         m_currentWindowIndex = (m_currentWindowIndex + 1) % sz;
         xcb_window_t w = m_windowList[m_currentWindowIndex];
-
-        xcb_get_window_attributes_cookie_t c = xcb_get_window_attributes(m_conn, w);
+        auto c = xcb_get_window_attributes(m_conn, w);
         UniqueXCBReply<xcb_get_window_attributes_reply_t> ar(
             xcb_get_window_attributes_reply(m_conn, c, nullptr)
         );
@@ -568,15 +584,25 @@ void WM::focusNextWindow()
 
 void WM::handleButtonPress(xcb_button_press_event_t *ev)
 {
-    // Ignore button presses on pop-up dialogs.
+    // For exit confirmation and runner dialogs (modal), ignore mouse clicks.
     if ((m_isExitConfirmationActive && ev->event == m_exitConfirmationWindow) ||
-        (m_isRunnerActive && ev->event == m_runnerWindow) ||
-        (m_isHelpActive && ev->event == m_helpWindow))
+        (m_isRunnerActive && ev->event == m_runnerWindow))
         return;
 
+    // If the event is on the help popup, check if the click is within the exit button.
+    if (m_isHelpActive && ev->event == m_helpWindow) {
+        int x = ev->event_x;
+        int y = ev->event_y;
+        if (x >= EXIT_BTN_X && x <= EXIT_BTN_X + EXIT_BTN_W &&
+            y >= EXIT_BTN_Y && y <= EXIT_BTN_Y + EXIT_BTN_H) {
+            destroyHelpPopup();
+        }
+        return;
+    }
+
     bool altPressed = (ev->state & XCB_MOD_MASK_1);
-    if (!altPressed) return;
-    if (ev->child == XCB_NONE) return;
+    if (!altPressed || ev->child == XCB_NONE)
+        return;
     xcb_window_t w = ev->child;
     auto geom = getWindowGeometry(w);
     if (ev->detail == 1) { // left button => move
@@ -615,8 +641,8 @@ void WM::handleMotionNotify(xcb_motion_notify_event_t *ev)
     } else if (resizeStart.window != XCB_NONE) {
         int dx = ev->root_x - resizeStart.start_x;
         int dy = ev->root_y - resizeStart.start_y;
-        uint16_t nw = std::max((int)resizeStart.start_width + dx, 50);
-        uint16_t nh = std::max((int)resizeStart.start_height + dy, 50);
+        uint16_t nw = std::max(static_cast<int>(resizeStart.start_width) + dx, 50);
+        uint16_t nh = std::max(static_cast<int>(resizeStart.start_height) + dy, 50);
         uint32_t vals[2] = { nw, nh };
         xcb_configure_window(m_conn, resizeStart.window, XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, vals);
         invalidateGeometryCache(resizeStart.window);
@@ -633,7 +659,7 @@ void WM::handleButtonRelease(xcb_button_release_event_t *ev)
 
 void WM::toggleFullscreen(xcb_window_t w)
 {
-    if (!w) return;
+    if (w == XCB_NONE) return;
     bool isFS = false;
     {
         UniqueXCBReply<xcb_get_property_reply_t> prop(
@@ -642,7 +668,7 @@ void WM::toggleFullscreen(xcb_window_t w)
             nullptr)
         );
         if (prop) {
-            xcb_atom_t* states = static_cast<xcb_atom_t*>(xcb_get_property_value(prop.get()));
+            auto *states = static_cast<xcb_atom_t*>(xcb_get_property_value(prop.get()));
             int len = xcb_get_property_value_length(prop.get()) / sizeof(xcb_atom_t);
             for (int i = 0; i < len; i++) {
                 if (states[i] == NET_WM_STATE_FULLSCREEN) {
@@ -679,32 +705,28 @@ void WM::toggleFullscreen(xcb_window_t w)
 void WM::createPopUpWindow(const char* title, xcb_window_t &winVar,
                            uint16_t width, uint16_t height, bool &activeFlag)
 {
-    if (activeFlag) return;
+    if (activeFlag)
+        return;
     activeFlag = true;
-
     winVar = xcb_generate_id(m_conn);
     int x = (m_screenWidth - width) / 2;
     int y = (m_screenHeight - height) / 2;
-
     uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
     uint32_t vals[2] = {
         BACKGROUND_COLOR,
         XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_KEY_PRESS |
         XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE
     };
-
     xcb_create_window(m_conn, m_screen->root_depth,
                       winVar, m_screen->root,
                       x, y, width, height, 0,
                       XCB_WINDOW_CLASS_INPUT_OUTPUT,
                       m_screen->root_visual,
                       mask, vals);
-
     xcb_change_property(m_conn, XCB_PROP_MODE_REPLACE,
                         winVar, XCB_ATOM_WM_NAME,
                         XCB_ATOM_STRING, 8,
                         std::strlen(title), title);
-
     xcb_map_window(m_conn, winVar);
     m_windowList.push_back(winVar);
     m_currentWindowIndex = m_windowList.size() - 1;
@@ -714,17 +736,14 @@ void WM::createPopUpWindow(const char* title, xcb_window_t &winVar,
 
 void WM::destroyPopUpWindow(xcb_window_t &winVar, bool &activeFlag)
 {
-    if (!activeFlag || winVar == XCB_NONE) return;
+    if (!activeFlag || winVar == XCB_NONE)
+        return;
     xcb_unmap_window(m_conn, winVar);
     xcb_destroy_window(m_conn, winVar);
-
-    auto it = std::find(m_windowList.begin(), m_windowList.end(), winVar);
-    if (it != m_windowList.end()) {
-        m_windowList.erase(it);
-        if (m_currentWindowIndex >= m_windowList.size())
-            m_currentWindowIndex = 0;
-    }
-    winVar   = XCB_NONE;
+    m_windowList.erase(std::remove(m_windowList.begin(), m_windowList.end(), winVar), m_windowList.end());
+    if (m_currentWindowIndex >= m_windowList.size())
+        m_currentWindowIndex = 0;
+    winVar    = XCB_NONE;
     activeFlag = false;
     xcb_flush(m_conn);
     resetFocus();
@@ -732,14 +751,15 @@ void WM::destroyPopUpWindow(xcb_window_t &winVar, bool &activeFlag)
 
 void WM::resetFocus()
 {
-    if (!m_windowList.empty()) {
+    if (!m_windowList.empty())
         focusWindow(m_windowList.back());
-    } else {
+    else {
         xcb_set_input_focus(m_conn, XCB_INPUT_FOCUS_POINTER_ROOT, m_screen->root, XCB_CURRENT_TIME);
         xcb_flush(m_conn);
     }
 }
 
+// For exit confirmation and runner dialogs (unchanged)
 void WM::createExitConfirmationDialog()
 {
     createPopUpWindow("Confirm Exit", m_exitConfirmationWindow, 300, 100, m_isExitConfirmationActive);
@@ -758,6 +778,8 @@ void WM::handleExitConfirmationKeypress(xcb_keysym_t ks)
 
 void WM::createRunnerDialog()
 {
+    if (m_isExitConfirmationActive)
+        return;
     createPopUpWindow("Run Program", m_runnerWindow, RUNNER_WIDTH, RUNNER_HEIGHT, m_isRunnerActive);
     m_runnerInput.clear();
 }
@@ -767,11 +789,12 @@ void WM::destroyRunnerDialog()
     m_runnerInput.clear();
 }
 
-void WM::createHelpDialog()
+void WM::createHelpPopup()
 {
-    createPopUpWindow("Key Bindings", m_helpWindow, 400, 240, m_isHelpActive);
+    // Create the help popup regardless of other modals.
+    createPopUpWindow("Key Bindings", m_helpWindow, HELP_WIDTH, HELP_HEIGHT, m_isHelpActive);
 }
-void WM::destroyHelpDialog()
+void WM::destroyHelpPopup()
 {
     destroyPopUpWindow(m_helpWindow, m_isHelpActive);
 }
@@ -785,7 +808,8 @@ void WM::drawText(xcb_window_t win, const char* fontName, const char* text,
     uint32_t mask = XCB_GC_FOREGROUND | XCB_GC_BACKGROUND | XCB_GC_FONT;
     uint32_t vals[3] = { fgColor, bgColor, font };
     xcb_create_gc(m_conn, gc, win, mask, vals);
-    xcb_image_text_8(m_conn, std::strlen(text), win, gc, x, y, text);
+    size_t len = std::strlen(text);
+    xcb_image_text_8(m_conn, len, win, gc, x, y, text);
     xcb_close_font(m_conn, font);
     xcb_free_gc(m_conn, gc);
     xcb_flush(m_conn);
@@ -795,51 +819,36 @@ void WM::handleExpose(xcb_expose_event_t *ev)
 {
     xcb_window_t w = ev->window;
     if (m_isRunnerActive && w == m_runnerWindow) {
-        xcb_gcontext_t bgGc = xcb_generate_id(m_conn);
-        uint32_t bgMask = XCB_GC_FOREGROUND | XCB_GC_BACKGROUND;
-        uint32_t bgVals[2] = { BACKGROUND_COLOR, BACKGROUND_COLOR };
-        xcb_create_gc(m_conn, bgGc, w, bgMask, bgVals);
-        xcb_rectangle_t rect = {0, 0, ev->width, ev->height};
-        xcb_poly_fill_rectangle(m_conn, w, bgGc, 1, &rect);
-        xcb_free_gc(m_conn, bgGc);
+        fillRect(m_conn, w, 0, 0, ev->width, ev->height, BACKGROUND_COLOR);
         int textY = RUNNER_HEIGHT / 2 + 10;
         drawText(w, RUNNER_FONT, m_runnerInput.c_str(), 10, textY, FOREGROUND_COLOR, BACKGROUND_COLOR);
     }
     else if (m_isExitConfirmationActive && w == m_exitConfirmationWindow) {
-        xcb_gcontext_t bgGc = xcb_generate_id(m_conn);
-        uint32_t bgMask = XCB_GC_FOREGROUND | XCB_GC_BACKGROUND;
-        uint32_t bgVals[2] = { BACKGROUND_COLOR, BACKGROUND_COLOR };
-        xcb_create_gc(m_conn, bgGc, w, bgMask, bgVals);
-        xcb_rectangle_t rect = {0, 0, ev->width, ev->height};
-        xcb_poly_fill_rectangle(m_conn, w, bgGc, 1, &rect);
-        xcb_free_gc(m_conn, bgGc);
+        fillRect(m_conn, w, 0, 0, ev->width, ev->height, BACKGROUND_COLOR);
         const char *msg = "Exit WM? (Y/N or ESC)";
         drawText(w, DEFAULT_FONT, msg, 10, ev->height/2, FOREGROUND_COLOR, BACKGROUND_COLOR);
     }
     else if (m_isHelpActive && w == m_helpWindow) {
-        xcb_gcontext_t bgGc = xcb_generate_id(m_conn);
-        uint32_t bgMask = XCB_GC_FOREGROUND | XCB_GC_BACKGROUND;
-        uint32_t bgVals[2] = { HELP_BG_COLOR, HELP_BG_COLOR };
-        xcb_create_gc(m_conn, bgGc, w, bgMask, bgVals);
-        xcb_rectangle_t rect = {0, 0, ev->width, ev->height};
-        xcb_poly_fill_rectangle(m_conn, w, bgGc, 1, &rect);
-        xcb_free_gc(m_conn, bgGc);
+        // Draw help background and text.
+        fillRect(m_conn, w, 0, 0, ev->width, ev->height, HELP_BG_COLOR);
         const char* lines[] = {
             "Alt+F          => Toggle fullscreen",
             "Alt+E          => Close focused window",
             "Alt+Q          => Exit confirmation dialog",
             "Alt+R          => Runner prompt",
             "Alt+Tab        => Focus next window",
-            "Alt+I          => Help dialog",
+            "Alt+I          => Show this help popup",
             "Alt+M          => Minimize window",
             "Alt+N          => Restore all minimized"
         };
-        int lineCount = sizeof(lines) / sizeof(lines[0]);
-        int y = 20;
-        for (int i = 0; i < lineCount; i++) {
-            drawText(w, DEFAULT_FONT, lines[i], 10, y, FOREGROUND_COLOR, HELP_BG_COLOR);
+        int y = 40;
+        for (const auto &line : lines) {
+            drawText(w, DEFAULT_FONT, line, 10, y, FOREGROUND_COLOR, HELP_BG_COLOR);
             y += 20;
         }
+        // Draw Exit button in the top-right corner.
+        fillRect(m_conn, w, EXIT_BTN_X, EXIT_BTN_Y, EXIT_BTN_W, EXIT_BTN_H, 0xFF0000);
+        drawText(w, DEFAULT_FONT, "Exit", EXIT_BTN_X + 5, EXIT_BTN_Y + 15, FOREGROUND_COLOR, 0xFF0000);
     }
 }
 
@@ -847,9 +856,8 @@ void WM::handleExpose(xcb_expose_event_t *ev)
 void WM::handleEnterNotify(xcb_enter_notify_event_t *ev)
 {
     if (ev->event != XCB_NONE) {
-        auto it = std::find(m_windowList.begin(), m_windowList.end(), ev->event);
-        if (it != m_windowList.end()) {
-            focusWindow(*it);
+        if (std::find(m_windowList.begin(), m_windowList.end(), ev->event) != m_windowList.end()) {
+            focusWindow(ev->event);
         }
     }
 }
@@ -869,10 +877,8 @@ void WM::invalidateGeometryCache(xcb_window_t w)
 
 WM::WindowGeometry WM::getWindowGeometry(xcb_window_t w)
 {
-    auto it = m_geometryCache.find(w);
-    if (it != m_geometryCache.end()) {
+    if (auto it = m_geometryCache.find(w); it != m_geometryCache.end())
         return it->second;
-    }
     UniqueXCBReply<xcb_get_geometry_reply_t> geom(
         xcb_get_geometry_reply(m_conn, xcb_get_geometry(m_conn, w), nullptr)
     );
@@ -888,34 +894,29 @@ void WM::handleKeyPress(xcb_key_press_event_t *ev)
 {
     if (!ev) return;
     xcb_keysym_t ks = getKeysym(ev->detail, ev->state);
-
-    if (m_isExitConfirmationActive) {
-        handleExitConfirmationKeypress(ks);
+    // Process exit confirmation and runner modals exclusively.
+    if (m_isExitConfirmationActive || m_isRunnerActive) {
+        if (m_isExitConfirmationActive)
+            handleExitConfirmationKeypress(ks);
+        else if (m_isRunnerActive)
+            handleRunnerInput(ks);
         return;
     }
-    if (m_isRunnerActive) {
-        handleRunnerInput(ks);
+    // If the key event is for the help popup and Esc is pressed, close it.
+    if (m_isHelpActive && ev->event == m_helpWindow && ks == XK_Escape) {
+        destroyHelpPopup();
         return;
     }
-    if (m_isHelpActive) {
-        if (ks == XK_Escape) {
-            destroyHelpDialog();
-        }
-        return;
-    }
-
     bool altPressed = (ev->state & XCB_MOD_MASK_1);
-
+    if (!altPressed) return;
     auto getFocusedWindow = [this]() -> xcb_window_t {
         xcb_get_input_focus_cookie_t ck = xcb_get_input_focus(m_conn);
-        UniqueXCBReply<xcb_get_input_focus_reply_t> rp(xcb_get_input_focus_reply(m_conn, ck, nullptr));
-        if (!rp) return XCB_NONE;
-        return rp->focus;
+        UniqueXCBReply<xcb_get_input_focus_reply_t> rp(
+            xcb_get_input_focus_reply(m_conn, ck, nullptr)
+        );
+        return rp ? rp->focus : XCB_NONE;
     };
     xcb_window_t foc = getFocusedWindow();
-
-    if (!altPressed) return;
-
     switch (ks) {
         case XK_f:
             toggleFullscreen(foc);
@@ -960,7 +961,7 @@ void WM::handleKeyPress(xcb_key_press_event_t *ev)
             createRunnerDialog();
             break;
         case XK_i:
-            createHelpDialog();
+            createHelpPopup();
             break;
         case XK_Tab:
             focusNextWindow();
@@ -971,17 +972,14 @@ void WM::handleKeyPress(xcb_key_press_event_t *ev)
                 foc != m_exitConfirmationWindow &&
                 foc != m_helpWindow)
             {
-                auto it = std::find(m_windowList.begin(), m_windowList.end(), foc);
-                if (it != m_windowList.end()) {
-                    m_windowList.erase(it);
-                }
+                m_windowList.erase(std::remove(m_windowList.begin(), m_windowList.end(), foc), m_windowList.end());
                 m_minimizedWindows.push_back(foc);
                 xcb_unmap_window(m_conn, foc);
                 resetFocus();
             }
             break;
         case XK_n:
-            for (xcb_window_t w : m_minimizedWindows) {
+            for (auto w : m_minimizedWindows) {
                 xcb_map_window(m_conn, w);
                 if (std::find(m_windowList.begin(), m_windowList.end(), w) == m_windowList.end()) {
                     m_windowList.push_back(w);
@@ -1002,11 +1000,9 @@ void WM::handleMapRequest(xcb_map_request_event_t *mr)
     UniqueXCBReply<xcb_get_window_attributes_reply_t> attr(
         xcb_get_window_attributes_reply(m_conn, xcb_get_window_attributes(m_conn, mr->window), nullptr)
     );
-    if (attr) {
-        if (attr->override_redirect) {
-            xcb_map_window(m_conn, mr->window);
-            return;
-        }
+    if (attr && attr->override_redirect) {
+        xcb_map_window(m_conn, mr->window);
+        return;
     }
     xcb_map_window(m_conn, mr->window);
     {
@@ -1014,19 +1010,16 @@ void WM::handleMapRequest(xcb_map_request_event_t *mr)
         xcb_configure_window(m_conn, mr->window, XCB_CONFIG_WINDOW_STACK_MODE, vals);
     }
     focusWindow(mr->window);
-
     if (std::find(m_windowList.begin(), m_windowList.end(), mr->window) == m_windowList.end()) {
         m_windowList.push_back(mr->window);
         m_currentWindowIndex = m_windowList.size() - 1;
     }
-
 #ifdef FOCUS_FOLLOWS_MOUSE
     {
         uint32_t enter_mask = XCB_EVENT_MASK_ENTER_WINDOW;
         xcb_change_window_attributes(m_conn, mr->window, XCB_CW_EVENT_MASK, &enter_mask);
     }
 #endif
-
     auto g = getWindowGeometry(mr->window);
     xcb_configure_notify_event_t ce = {};
     ce.response_type = XCB_CONFIGURE_NOTIFY;
@@ -1045,12 +1038,9 @@ void WM::handleMapRequest(xcb_map_request_event_t *mr)
 void WM::handleDestroyNotify(xcb_destroy_notify_event_t *dn)
 {
     xcb_window_t w = dn->window;
-    auto it = std::find(m_windowList.begin(), m_windowList.end(), w);
-    if (it != m_windowList.end()) {
-        m_windowList.erase(it);
-        if (m_currentWindowIndex >= m_windowList.size())
-            m_currentWindowIndex = 0;
-    }
+    m_windowList.erase(std::remove(m_windowList.begin(), m_windowList.end(), w), m_windowList.end());
+    if (m_currentWindowIndex >= m_windowList.size())
+        m_currentWindowIndex = 0;
     invalidateGeometryCache(w);
 }
 
@@ -1117,7 +1107,7 @@ void WM::executeCommand(const std::string &cmd)
     }
     if (pid == 0) {
         if (setsid() == -1) _exit(1);
-        for (int fd = 0; fd < (int)sysconf(_SC_OPEN_MAX); fd++) {
+        for (int fd = 0; fd < static_cast<int>(sysconf(_SC_OPEN_MAX)); fd++) {
             close(fd);
         }
         execl("/bin/sh", "sh", "-c", cmd.c_str(), (char*)nullptr);
@@ -1147,20 +1137,16 @@ void WM::redrawRunnerDialog()
 int main()
 {
     signal(SIGCHLD, SIG_IGN);
-
     const char* home = getenv("HOME");
     std::string logPath = home ? std::string(home) + "/lwm.log" : "lwm.log";
     Logger logger(logPath);
     logger.log("Starting LWM Minimal WM with new features...");
-
     WM wm(logger);
     if (!wm.initialize()) {
         logger.log("LWM initialization failed.");
         return 1;
     }
-
     wm.runEventLoop();
     wm.cleanup();
-
     return 0;
 }
